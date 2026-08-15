@@ -16,7 +16,11 @@
 extern "C" {
 #endif
 
+#ifdef USE_XENOMAI_EVL
+#include <evl/mutex.h>
+#else
 #include <pthread.h>
+#endif
 
 /** pointer structure to Tx and Rx stacks */
 typedef struct
@@ -52,6 +56,10 @@ typedef struct
    int rxsa[EC_MAXBUF];
    /** temporary rx buffer */
    ec_bufT tempinbuf;
+#ifdef USE_XENOMAI_EVL
+   /** EVL out-of-band network device fd for the secondary interface */
+   int evl_netdevfd;
+#endif
 } ecx_redportt;
 
 /** pointer structure to buffers, vars and mutexes for port instantiation */
@@ -83,9 +91,18 @@ typedef struct
    int redstate;
    /** pointer to redundancy port and buffers */
    ecx_redportt *redport;
+#ifdef USE_XENOMAI_EVL
+   /** EVL out-of-band network device fd for the primary interface */
+   int evl_netdevfd;
+
+   struct evl_mutex getindex_mutex;
+   struct evl_mutex tx_mutex;
+   struct evl_mutex rx_mutex;
+#else
    pthread_mutex_t getindex_mutex;
    pthread_mutex_t tx_mutex;
    pthread_mutex_t rx_mutex;
+#endif
 } ecx_portt;
 
 extern const uint16 priMAC[3];

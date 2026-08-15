@@ -14,6 +14,13 @@ extern "C" {
 #include <pthread.h>
 #include <sys/time.h>
 
+#ifdef USE_XENOMAI_EVL
+#include <evl/evl.h>
+#include <evl/thread.h>
+#include <evl/mutex.h>
+#include <evl/clock.h>
+#endif
+
 // define if debug printf is needed
 #ifdef EC_DEBUG
 #include <stdio.h>
@@ -37,7 +44,11 @@ extern "C" {
 #define OSAL_THREAD_FUNC    void
 #define OSAL_THREAD_FUNC_RT void
 
-#define osal_mutext         pthread_mutex_t
+#ifdef USE_XENOMAI_EVL
+#define osal_mutext struct evl_mutex
+#else
+#define osal_mutext pthread_mutex_t
+#endif
 
 #ifdef __cplusplus
 }

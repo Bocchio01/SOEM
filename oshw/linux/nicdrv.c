@@ -45,7 +45,12 @@
 #include <string.h>
 #include <netpacket/packet.h>
 #include <pthread.h>
+
+#ifdef USE_XENOMAI_EVL
+#include <evl/net/net.h>
+#else
 #include <poll.h>
+#endif
 
 #include "oshw.h"
 #include "osal.h"
@@ -96,7 +101,13 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
    struct ifreq ifr;
    struct sockaddr_ll sll;
    int *psock;
+#ifdef USE_XENOMAI_EVL
+   int *pdevfd;
+   int devfd, portfd;
+   struct evl_net_devstat devs;
+#else
    pthread_mutexattr_t mutexattr;
+#endif
 
    rval = 0;
    if (secondary)
@@ -107,6 +118,10 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
          /* when using secondary socket it is automatically a redundant setup */
          psock = &(port->redport->sockhandle);
          *psock = -1;
+#ifdef USE_XENOMAI_EVL
+         pdevfd = &(port->redport->evl_netdevfd);
+         port->redport->evl_netdevfd = -1;
+#endif
          port->redstate = ECT_RED_DOUBLE;
          port->redport->stack.sock = &(port->redport->sockhandle);
          port->redport->stack.txbuf = &(port->txbuf);
@@ -125,11 +140,21 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
    }
    else
    {
+#ifdef USE_XENOMAI_EVL
+      if (evl_new_mutex(&(port->getindex_mutex), "soem-getindex-%d", (int)getpid()) < 0 ||
+          evl_new_mutex(&(port->tx_mutex), "soem-tx-%d", (int)getpid()) < 0 ||
+          evl_new_mutex(&(port->rx_mutex), "soem-rx-%d", (int)getpid()) < 0)
+      {
+         return 0;
+      }
+      port->evl_netdevfd = -1;
+#else
       pthread_mutexattr_init(&mutexattr);
       pthread_mutexattr_setprotocol(&mutexattr, PTHREAD_PRIO_INHERIT);
       pthread_mutex_init(&(port->getindex_mutex), &mutexattr);
       pthread_mutex_init(&(port->tx_mutex), &mutexattr);
       pthread_mutex_init(&(port->rx_mutex), &mutexattr);
+#endif
       port->sockhandle = -1;
       port->lastidx = 0;
       port->redstate = ECT_RED_NONE;
@@ -142,9 +167,49 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
       port->stack.rxsa = &(port->rxsa);
       ecx_clear_rxbufstat(&(port->rxbufstat[0]));
       psock = &(port->sockhandle);
+#ifdef USE_XENOMAI_EVL
+      pdevfd = &(port->evl_netdevfd);
+#endif
    }
+
+#ifdef USE_XENOMAI_EVL
+   devfd = evl_net_open_dev(ifname);
+   if (devfd < 0)
+   {
+      EC_PRINT("ecx_setupnic: evl_net_open_dev(%s) failed: %d -- "
+               "is CONFIG_EVL_NET enabled in the running kernel?\n",
+               ifname, devfd);
+      return 0;
+   }
+   *pdevfd = devfd;
+
+   portfd = evl_net_enable_port(devfd, 0, 0);
+   if (portfd < 0)
+   {
+      EC_PRINT("ecx_setupnic: evl_net_enable_port(%s) failed: %d\n", ifname, portfd);
+      return 0;
+   }
+
+   if (evl_net_set_filter(devfd, EVL_ECAT_FILTER_PATH) < 0)
+   {
+      EC_PRINT("ecx_setupnic: evl_net_set_filter(%s, %s) failed -- "
+               "EtherCAT frames will most likely NOT be diverted to the "
+               "out-of-band stack.\n",
+               ifname, EVL_ECAT_FILTER_PATH);
+   }
+
+   if (evl_net_query_dev(devfd, &devs) == 0 && !devs.oob_capable)
+   {
+      EC_PRINT("ecx_setupnic: WARNING - NIC driver for %s is not out-of-band capable.\n", ifname);
+   }
+
+   /* we use RAW packet socket, with packet type ETH_P_ECAT, extended with SOCK_OOB */
+   *psock = socket(PF_PACKET, SOCK_RAW | SOCK_OOB, htons(ETH_P_ECAT));
+#else
    /* we use RAW packet socket, with packet type ETH_P_ECAT */
    *psock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ECAT));
+#endif
+
    if (*psock < 0)
       return 0;
 
@@ -167,7 +232,7 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
    r |= ioctl(*psock, SIOCSIFFLAGS, &ifr);
 
    /* bind socket to protocol, in this case RAW EtherCAT */
-   memset((void*)&sll, 0, sizeof(sll));
+   memset((void *)&sll, 0, sizeof(sll));
    sll.sll_family = AF_PACKET;
    sll.sll_ifindex = ifindex;
    sll.sll_protocol = htons(ETH_P_ECAT);
@@ -192,8 +257,25 @@ int ecx_closenic(ecx_portt *port)
 {
    if (port->sockhandle >= 0)
       close(port->sockhandle);
-   if ((port->redport) && (port->redport->sockhandle >= 0))
-      close(port->redport->sockhandle);
+#ifdef USE_XENOMAI_EVL
+   if (port->evl_netdevfd >= 0)
+   {
+      evl_net_disable_port(port->evl_netdevfd);
+      close(port->evl_netdevfd);
+   }
+#endif
+   if (port->redport)
+   {
+      if (port->redport->sockhandle >= 0)
+         close(port->redport->sockhandle);
+#ifdef USE_XENOMAI_EVL
+      if (port->redport->evl_netdevfd >= 0)
+      {
+         evl_net_disable_port(port->redport->evl_netdevfd);
+         close(port->redport->evl_netdevfd);
+      }
+#endif
+   }
 
    return 0;
 }
@@ -225,7 +307,11 @@ uint8 ecx_getindex(ecx_portt *port)
    uint8 idx;
    uint8 cnt;
 
+#ifdef USE_XENOMAI_EVL
+   evl_lock_mutex(&(port->getindex_mutex));
+#else
    pthread_mutex_lock(&(port->getindex_mutex));
+#endif
 
    idx = port->lastidx + 1;
    /* index can't be larger than buffer array */
@@ -249,7 +335,11 @@ uint8 ecx_getindex(ecx_portt *port)
       port->redport->rxbufstat[idx] = EC_BUF_ALLOC;
    port->lastidx = idx;
 
+#ifdef USE_XENOMAI_EVL
+   evl_unlock_mutex(&(port->getindex_mutex));
+#else
    pthread_mutex_unlock(&(port->getindex_mutex));
+#endif
 
    return idx;
 }
@@ -276,6 +366,10 @@ int ecx_outframe(ecx_portt *port, uint8 idx, int stacknumber)
 {
    int lp, rval;
    ec_stackT *stack;
+#ifdef USE_XENOMAI_EVL
+   struct oob_msghdr msghdr;
+   struct iovec iov;
+#endif
 
    if (!stacknumber)
    {
@@ -287,7 +381,17 @@ int ecx_outframe(ecx_portt *port, uint8 idx, int stacknumber)
    }
    lp = (*stack->txbuflength)[idx];
    (*stack->rxbufstat)[idx] = EC_BUF_TX;
+
+#ifdef USE_XENOMAI_EVL
+   iov.iov_base = (*stack->txbuf)[idx];
+   iov.iov_len = lp;
+   memset(&msghdr, 0, sizeof(msghdr));
+   msghdr.msg_iov = &iov;
+   msghdr.msg_iovlen = 1;
+   rval = oob_sendmsg(*stack->sock, &msghdr, NULL, MSG_DONTWAIT);
+#else
    rval = send(*stack->sock, (*stack->txbuf)[idx], lp, 0);
+#endif
    if (rval == -1)
    {
       (*stack->rxbufstat)[idx] = EC_BUF_EMPTY;
@@ -314,7 +418,13 @@ int ecx_outframe_red(ecx_portt *port, uint8 idx)
    rval = ecx_outframe(port, idx, 0);
    if (port->redstate != ECT_RED_NONE)
    {
+#ifdef USE_XENOMAI_EVL
+      struct oob_msghdr msghdr;
+      struct iovec iov;
+      evl_lock_mutex(&(port->tx_mutex));
+#else
       pthread_mutex_lock(&(port->tx_mutex));
+#endif
       ehp = (ec_etherheadert *)&(port->txbuf2);
       /* use dummy frame for secondary socket transmit (BRD) */
       datagramP = (ec_comt *)&(port->txbuf2[ETH_HEADERSIZE]);
@@ -324,11 +434,25 @@ int ecx_outframe_red(ecx_portt *port, uint8 idx)
       ehp->sa1 = htons(secMAC[1]);
       /* transmit over secondary socket */
       port->redport->rxbufstat[idx] = EC_BUF_TX;
+
+#ifdef USE_XENOMAI_EVL
+      iov.iov_base = &(port->txbuf2);
+      iov.iov_len = port->txbuflength2;
+      memset(&msghdr, 0, sizeof(msghdr));
+      msghdr.msg_iov = &iov;
+      msghdr.msg_iovlen = 1;
+      if (oob_sendmsg(port->redport->sockhandle, &msghdr, NULL, MSG_DONTWAIT) == -1)
+#else
       if (send(port->redport->sockhandle, &(port->txbuf2), port->txbuflength2, 0) == -1)
+#endif
       {
          port->redport->rxbufstat[idx] = EC_BUF_EMPTY;
       }
+#ifdef USE_XENOMAI_EVL
+      evl_unlock_mutex(&(port->tx_mutex));
+#else
       pthread_mutex_unlock(&(port->tx_mutex));
+#endif
    }
 
    return rval;
@@ -343,6 +467,10 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
 {
    int lp, bytesrx;
    ec_stackT *stack;
+#ifdef USE_XENOMAI_EVL
+   struct oob_msghdr msghdr;
+   struct iovec iov;
+#endif
 
    if (!stacknumber)
    {
@@ -353,22 +481,23 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
       stack = &(port->redport->stack);
    }
    lp = sizeof(port->tempinbuf);
+
+#ifdef USE_XENOMAI_EVL
+   iov.iov_base = (*stack->tempbuf);
+   iov.iov_len = lp;
+   memset(&msghdr, 0, sizeof(msghdr));
+   msghdr.msg_iov = &iov;
+   msghdr.msg_iovlen = 1;
+   bytesrx = oob_recvmsg(*stack->sock, &msghdr, NULL, MSG_DONTWAIT);
+#else
    bytesrx = recv(*stack->sock, (*stack->tempbuf), lp, MSG_DONTWAIT);
+#endif
    port->tempinbufs = bytesrx;
 
    return (bytesrx > 0);
 }
 
-/** Non blocking receive frame function. Uses RX buffer and index to combine
- * read frame with transmitted frame. To compensate for received frames that
- * are out-of-order all frames are stored in their respective indexed buffer.
- * If a frame was placed in the buffer previously, the function retrieves it
- * from that buffer index without calling ec_recvpkt. If the requested index
- * is not already in the buffer it calls ec_recvpkt to fetch it. There are
- * three options now, 1 no frame read, so exit. 2 frame read but other
- * than requested index, store in buffer and exit. 3 frame read with matching
- * index, store in buffer, set completed flag in buffer status and exit.
- *
+/** Non blocking receive frame function.
  * @param[in] port        = port context struct
  * @param[in] idx         = requested index of frame
  * @param[in] stacknumber = 0=primary 1=secondary stack
@@ -406,7 +535,11 @@ int ecx_inframe(ecx_portt *port, uint8 idx, int stacknumber)
    }
    else
    {
+#ifdef USE_XENOMAI_EVL
+      evl_lock_mutex(&(port->rx_mutex));
+#else
       pthread_mutex_lock(&(port->rx_mutex));
+#endif
       /* check again if requested index is already in buffer ?
        * other task might have reveived it befor we grabbed mutex */
       if ((idx < EC_MAXBUF) && ((*stack->rxbufstat)[idx] == EC_BUF_RCVD))
@@ -460,19 +593,18 @@ int ecx_inframe(ecx_portt *port, uint8 idx, int stacknumber)
             }
          }
       }
+#ifdef USE_XENOMAI_EVL
+      evl_unlock_mutex(&(port->rx_mutex));
+#else
       pthread_mutex_unlock(&(port->rx_mutex));
+#endif
    }
 
    /* WKC if matching frame found */
    return rval;
 }
 
-/** Blocking redundant receive frame function. If redundant mode is not active then
- * it skips the secondary stack and redundancy functions. In redundant mode it waits
- * for both (primary and secondary) frames to come in. The result goes in an decision
- * tree that decides, depending on the route of the packet and its possible missing arrival,
- * how to reroute the original packet to get the data in an other try.
- *
+/** Blocking redundant receive frame function.
  * @param[in] port        = port context struct
  * @param[in] idx = requested index of frame
  * @param[in] timer = absolute timeout time
@@ -489,6 +621,24 @@ static int ecx_waitinframe_red(ecx_portt *port, uint8 idx, osal_timert *timer)
    /* if not in redundant mode then always assume secondary is OK */
    if (port->redstate == ECT_RED_NONE)
       wkc2 = 0;
+
+#ifdef USE_XENOMAI_EVL
+   do
+   {
+      evl_usleep(50);
+      /* only read frame if not already in */
+      if (wkc <= EC_NOFRAME)
+         wkc = ecx_inframe(port, idx, 0);
+      /* only try secondary if in redundant mode */
+      if (port->redstate != ECT_RED_NONE)
+      {
+         /* only read frame if not already in */
+         if (wkc2 <= EC_NOFRAME)
+            wkc2 = ecx_inframe(port, idx, 1);
+      }
+      /* wait for both frames to arrive or timeout */
+   } while (((wkc <= EC_NOFRAME) || (wkc2 <= EC_NOFRAME)) && !osal_timer_is_expired(timer));
+#else
    /* use ppoll to reduce busy_polling */
    struct pollfd fds[2];
    struct pollfd *fdsp;
@@ -526,6 +676,8 @@ static int ecx_waitinframe_red(ecx_portt *port, uint8 idx, osal_timert *timer)
       }
       /* wait for both frames to arrive or timeout */
    } while (((wkc <= EC_NOFRAME) || (wkc2 <= EC_NOFRAME)) && !osal_timer_is_expired(timer));
+#endif
+
    /* only do redundant functions when in redundant mode */
    if (port->redstate != ECT_RED_NONE)
    {
